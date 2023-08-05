@@ -2,7 +2,9 @@ package mygg
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 )
@@ -87,9 +89,42 @@ func (c *MQTTClient) Connect(url string) error {
 		return err
 	}
 
-	// TODO: Raead and handle CONNACK packetType
+	return c.readConnAck()
+}
 
-	return nil
+func (c *MQTTClient) readConnAck() error {
+	buffer := make([]byte, 4) // CONNACK packet is 4 bytes
+	n, err := io.ReadFull(c.conn, buffer)
+	if err != nil {
+		return fmt.Errorf("failed to read CONNACK: %w", err)
+	}
+	if n != 4 {
+		return fmt.Errorf("failed to read CONNACK: read %d bytes, expected 4", n)
+	}
+
+	// MQTT CONNACK packet structure
+	// byte 1: Packet type and flags (can be ignored)
+	// byte 2: Remaining length (always 2 for CONNACK, can be ignored)
+	// byte 3: Connect Acknowledge Flags (can be ignored for now)
+	// byte 4: Connect Return Code
+	returnCode := buffer[3]
+
+	switch returnCode {
+	case 0:
+		return nil // Connection Accepted
+	case 1:
+		return errors.New("connection refused: unacceptable protocol version")
+	case 2:
+		return errors.New("connection refused: identifier rejected")
+	case 3:
+		return errors.New("connection refused: server unavailable")
+	case 4:
+		return errors.New("connection refused: bad user name or password")
+	case 5:
+		return errors.New("connection refused: not authorized")
+	default:
+		return errors.New("unknown CONNACK error")
+	}
 }
 
 func (c *MQTTClient) Disconnect() error {
@@ -180,7 +215,7 @@ func (c *MQTTClient) writeConnectPacket(packet *MQTTConnectPacket) error {
 	return err
 }
 
-func (c *MQTTClient) writeDisconnectPacket(packet *MQTTDisconnectPacket) error {
+func (c *MQTTClient) writeDisconnectPacket(_ *MQTTDisconnectPacket) error {
 	// Fixed header
 	// Packet type and flags (fixed to 0 for DISCONNECT)
 	header := byte(DISCONNECT << 4)

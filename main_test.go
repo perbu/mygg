@@ -19,7 +19,7 @@ func TestMain(m *testing.M) {
 		if err != nil {
 			panic(err)
 		}
-		defer cmd.Process.Kill()
+		defer cmd.Process.Kill() // nolint: errcheck
 	}
 	time.Sleep(time.Millisecond * 200)
 	ret := m.Run()
