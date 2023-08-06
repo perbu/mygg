@@ -1,12 +1,14 @@
 package mygg
 
 import (
-	"encoding/binary"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // MQTT packetType types
@@ -37,110 +39,19 @@ const (
 	QoS2                // Exactly once
 )
 
-// MQTTPacket is the interface for all types of MQTT packets
-type MQTTPacket interface {
-	PacketType() byte
-	PacketID() MQTTPacketID
-}
-
-// MQTTConnectPacket is the CONNECT Packet
-type MQTTConnectPacket struct {
-	ClientID string
-}
-
-func (p *MQTTConnectPacket) PacketType() byte {
-	return CONNECT
-}
-
-func (p *MQTTConnectPacket) PacketID() MQTTPacketID {
-	return 0
+// mqttPacket is the interface for all types of MQTT packets
+type mqttPacket interface {
+	packetType() byte
+	packetID() mqttPacketID
 }
 
 // MQTTClient is the MQTT client
 type MQTTClient struct {
 	clientId string
 	conn     net.Conn
-	packetID MQTTPacketID
-}
-
-func New(clientID string) *MQTTClient {
-	return &MQTTClient{
-		clientId: clientID,
-	}
-}
-func (c *MQTTClient) Connect(url string) error {
-	ntype, address, err := parseURL(url)
-	if err != nil {
-		return fmt.Errorf("failed to parse URL: %w", err)
-	}
-	conn, err := net.Dial(ntype, address)
-	if err != nil {
-		return err
-	}
-	c.conn = conn
-	packet := &MQTTConnectPacket{
-		ClientID: c.clientId,
-	}
-
-	// Serialize packetType and write to connection
-	// We'll implement this in the next step
-	err = c.writePacket(packet)
-	if err != nil {
-		return err
-	}
-
-	return c.readConnAck()
-}
-
-func (c *MQTTClient) readConnAck() error {
-	buffer := make([]byte, 4) // CONNACK packet is 4 bytes
-	n, err := io.ReadFull(c.conn, buffer)
-	if err != nil {
-		return fmt.Errorf("failed to read CONNACK: %w", err)
-	}
-	if n != 4 {
-		return fmt.Errorf("failed to read CONNACK: read %d bytes, expected 4", n)
-	}
-
-	// MQTT CONNACK packet structure
-	// byte 1: Packet type and flags (can be ignored)
-	// byte 2: Remaining length (always 2 for CONNACK, can be ignored)
-	// byte 3: Connect Acknowledge Flags (can be ignored for now)
-	// byte 4: Connect Return Code
-	returnCode := buffer[3]
-
-	switch returnCode {
-	case 0:
-		return nil // Connection Accepted
-	case 1:
-		return errors.New("connection refused: unacceptable protocol version")
-	case 2:
-		return errors.New("connection refused: identifier rejected")
-	case 3:
-		return errors.New("connection refused: server unavailable")
-	case 4:
-		return errors.New("connection refused: bad user name or password")
-	case 5:
-		return errors.New("connection refused: not authorized")
-	default:
-		return errors.New("unknown CONNACK error")
-	}
-}
-
-func (c *MQTTClient) Disconnect() error {
-	packet := &MQTTDisconnectPacket{}
-	return c.writePacket(packet)
-}
-
-// DISCONNECT Packet
-type MQTTDisconnectPacket struct{}
-
-func (p *MQTTDisconnectPacket) PacketType() byte {
-	return DISCONNECT
-}
-
-func (p *MQTTDisconnectPacket) PacketID() MQTTPacketID {
-	return 0
+	packetID atomic.Uint32
+	mu       sync.Mutex
+	pCh      chan mqttPacket
 }
 
 // parseURL parses the URL and returns the network type and address
@@ -156,76 +67,20 @@ func parseURL(url string) (string, string, error) {
 	}
 	return ctype, addr, nil
 }
-func (c *MQTTClient) writePacket(packet MQTTPacket) error {
-	switch packet.PacketType() {
+
+func (c *MQTTClient) writePacket(packet mqttPacket) error {
+	switch packet.packetType() {
 	case CONNECT:
-		return c.writeConnectPacket(packet.(*MQTTConnectPacket))
+		return c.writeConnectPacket(packet.(*mqttConnectPacket))
 	case DISCONNECT:
-		return c.writeDisconnectPacket(packet.(*MQTTDisconnectPacket))
+		return c.writeDisconnectPacket(packet.(*mqttDisconnectPacket))
 	case PUBLISH:
-		return c.writePublishPacket(packet.(*MQTTPublishPacket))
+		return c.writePublishPacket(packet.(*mqttPublishPacket))
 	case SUBSCRIBE:
-		return c.writeSubscribePacket(packet.(*MQTTSubscribePacket))
+		return c.writeSubscribePacket(packet.(*mqttSubscribePacket))
 	default:
-		return fmt.Errorf("unsupported packetType type: %d", packet.PacketType())
+		return fmt.Errorf("unsupported packetType type: %d", packet.packetType())
 	}
-}
-
-func (c *MQTTClient) writeConnectPacket(packet *MQTTConnectPacket) error {
-	// Fixed header
-	// Packet type and flags (fixed to 0 for CONNECT)
-	header := byte(CONNECT << 4)
-
-	// Variable header
-	// Protocol name length
-	protocolNameLength := make([]byte, 2)
-	binary.BigEndian.PutUint16(protocolNameLength, uint16(len("MQTT")))
-	// Protocol name
-	protocolName := []byte("MQTT")
-	// Protocol level
-	protocolLevel := byte(4)
-	// Connect flags
-	connectFlags := byte(2) // Clean session flag is set
-	// Keep alive (10 seconds)
-	keepAlive := make([]byte, 2)
-	binary.BigEndian.PutUint16(keepAlive, uint16(10))
-
-	variableHeader := append(protocolNameLength, protocolName...)
-	variableHeader = append(variableHeader, protocolLevel, connectFlags)
-	variableHeader = append(variableHeader, keepAlive...)
-
-	// Payload
-	// Client ID length
-	clientIDLength := make([]byte, 2)
-	binary.BigEndian.PutUint16(clientIDLength, uint16(len(packet.ClientID)))
-	// Client ID
-	clientID := []byte(packet.ClientID)
-
-	payload := append(clientIDLength, clientID...)
-
-	// Remaining length
-	remainingLength := len(variableHeader) + len(payload)
-	remainingLengthEncoded := encodeRemainingLength(remainingLength)
-
-	packetBytes := append([]byte{header}, remainingLengthEncoded...)
-	packetBytes = append(packetBytes, variableHeader...)
-	packetBytes = append(packetBytes, payload...)
-
-	_, err := c.conn.Write(packetBytes)
-	return err
-}
-
-func (c *MQTTClient) writeDisconnectPacket(_ *MQTTDisconnectPacket) error {
-	// Fixed header
-	// Packet type and flags (fixed to 0 for DISCONNECT)
-	header := byte(DISCONNECT << 4)
-	// Remaining length (0 for DISCONNECT)
-	remainingLength := encodeRemainingLength(0)
-
-	packetBytes := append([]byte{header}, remainingLength...)
-
-	_, err := c.conn.Write(packetBytes)
-	return err
 }
 
 // Encode the remaining length field as per MQTT spec
@@ -248,116 +103,104 @@ func encodeRemainingLength(length int) []byte {
 	return encoded
 }
 
-// MQTTPublishPacket is the PUBLISH Packet
-type MQTTPublishPacket struct {
-	Topic   string
-	Payload []byte
-	QoS     MQTTQoS
+// mqttPacketID represents Packet Identifier
+type mqttPacketID uint16
+
+// mqttSubscribePacket is the SUBSCRIBE Packet
+
+// readPump reads packets from the connection and sends them into the packet channel
+func (c *MQTTClient) readPump(ctx context.Context) {
+	for {
+		packet, err := c.readPacket(ctx)
+		if err != nil {
+			return
+		}
+		c.pCh <- packet
+	}
 }
 
-func (p *MQTTPublishPacket) PacketType() byte {
-	return PUBLISH
+func (c *MQTTClient) readPacket(ctx context.Context) (mqttPacket, error) {
+	// Fixed header
+	// First byte is packet type and flags
+	header := make([]byte, 1)
+	_, err := io.ReadFull(c.conn, header)
+	if err != nil {
+		return nil, fmt.Errorf("read packet header: %w", err)
+	}
+	packetType := header[0] >> 4
+	flags := header[0] & 0x0F
+
+	// Remaining length (variable-length encoding)
+	remainingLength, err := c.readRemainingLength()
+	if err != nil {
+		return nil, fmt.Errorf("read remaining length: %w", err)
+	}
+
+	// Now we need to read the rest of the packet based on its type
+	switch packetType {
+	case CONNACK:
+		return c.readConnAckPacket(remainingLength)
+	case PUBLISH:
+		return c.readPublishPacket(flags, remainingLength)
+	default:
+		// TODO: Implement for other packet types
+		return nil, fmt.Errorf("unsupported packet type %d", packetType)
+	}
 }
 
-func (p *MQTTPublishPacket) PacketID() MQTTPacketID {
+type mqttConnAckPacket struct {
+	ReturnCode byte
+}
+
+func (m mqttConnAckPacket) packetType() byte {
+	return CONNACK
+}
+func (m mqttConnAckPacket) packetID() mqttPacketID {
 	return 0
 }
 
-func (c *MQTTClient) Publish(topic string, payload []byte) error {
-	packet := &MQTTPublishPacket{
-		Topic:   topic,
-		Payload: payload,
-		QoS:     QoS0,
+func (c *MQTTClient) readConnAckPacket(remainingLength int) (*mqttConnAckPacket, error) {
+	// Ensure the remaining length is 2 for a valid CONNACK packet
+	if remainingLength != 2 {
+		return nil, errors.New("invalid CONNACK packet: incorrect remaining length")
 	}
-	return c.writePacket(packet)
-}
 
-func (c *MQTTClient) writePublishPacket(packet *MQTTPublishPacket) error {
-	// Fixed header
-	// Packet type, flags (fixed to 0 for QoS 0)
-	header := byte(PUBLISH << 4)
-
-	// Variable header
-	// Topic name
-	topicLength := make([]byte, 2)
-	binary.BigEndian.PutUint16(topicLength, uint16(len(packet.Topic)))
-	topic := []byte(packet.Topic)
-
-	variableHeader := append(topicLength, topic...)
-
-	// Payload
-	payload := packet.Payload
-
-	// Remaining length
-	remainingLength := len(variableHeader) + len(payload)
-	remainingLengthEncoded := encodeRemainingLength(remainingLength)
-
-	packetBytes := append([]byte{header}, remainingLengthEncoded...)
-	packetBytes = append(packetBytes, variableHeader...)
-	packetBytes = append(packetBytes, payload...)
-
-	_, err := c.conn.Write(packetBytes)
-	return err
-}
-
-// MQTTPacketID represents Packet Identifier
-type MQTTPacketID uint16
-
-// MQTTSubscribePacket is the SUBSCRIBE Packet
-type MQTTSubscribePacket struct {
-	packetID MQTTPacketID
-	Topic    string
-	QoS      MQTTQoS
-}
-
-func (p *MQTTSubscribePacket) PacketType() byte {
-	return SUBSCRIBE
-}
-
-func (p *MQTTSubscribePacket) PacketID() MQTTPacketID {
-	return p.packetID
-}
-
-func (c *MQTTClient) Subscribe(topic string, qos MQTTQoS) error {
-	// Increment packet ID for each new packet
-	c.packetID++
-	packet := &MQTTSubscribePacket{
-		packetID: c.packetID,
-		Topic:    topic,
-		QoS:      qos,
+	buffer := make([]byte, 2)
+	_, err := io.ReadFull(c.conn, buffer)
+	if err != nil {
+		return nil, err
 	}
-	return c.writePacket(packet)
+
+	// Ignore the first byte (connect acknowledge flags)
+	returnCode := buffer[1]
+
+	return &mqttConnAckPacket{ReturnCode: returnCode}, nil
 }
 
-func (c *MQTTClient) writeSubscribePacket(packet *MQTTSubscribePacket) error {
-	// Fixed header
-	// Packet type and flags (fixed to 2 for SUBSCRIBE)
-	header := byte(SUBSCRIBE<<4 | 2)
+func (c *MQTTClient) readRemainingLength() (int, error) {
+	multiplier := 1
+	value := 0
+	for {
+		encodedByte := make([]byte, 1)
+		_, err := io.ReadFull(c.conn, encodedByte)
+		if err != nil {
+			return 0, err
+		}
+		value += int(encodedByte[0]&127) * multiplier
+		if encodedByte[0]&128 == 0 {
+			break
+		}
+		multiplier *= 128
+		if multiplier > 128*128*128 {
+			return 0, errors.New("malformed remaining length")
+		}
+	}
+	return value, nil
+}
 
-	// Variable header
-	// Packet ID
-	packetID := make([]byte, 2)
-	binary.BigEndian.PutUint16(packetID, uint16(packet.PacketID()))
-
-	// Payload
-	// Topic name
-	topicLength := make([]byte, 2)
-	binary.BigEndian.PutUint16(topicLength, uint16(len(packet.Topic)))
-	topic := []byte(packet.Topic)
-	// Requested QoS
-	qos := []byte{byte(packet.QoS)}
-
-	payload := append(topicLength, topic...)
-	payload = append(payload, qos...)
-
-	// Remaining length
-	remainingLength := 2 + len(payload) // 2 for packet ID, then payload
-	remainingLengthEncoded := encodeRemainingLength(remainingLength)
-
-	packetBytes := append([]byte{header}, remainingLengthEncoded...)
-	packetBytes = append(packetBytes, packetID...)
-	packetBytes = append(packetBytes, payload...)
-
-	_, err := c.conn.Write(packetBytes)
-	return err
+func (c *MQTTClient) handlePacket(packet mqttPacket) error {
+	switch packet.packetType() {
+	default:
+		return fmt.Errorf("unsupported packet type %d", packet.packetType())
+	}
 }

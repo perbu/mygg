@@ -1,6 +1,7 @@
 package mygg
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,7 +9,7 @@ import (
 	"time"
 )
 
-const startMosquitto = false
+const startMosquitto = true
 
 func TestMain(m *testing.M) {
 	// setup
@@ -28,22 +29,28 @@ func TestMain(m *testing.M) {
 
 func TestMQTTClient_TestLifeCycle(t *testing.T) {
 	fmt.Println("TestMQTTClient_Connect")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
 	c := New("test")
-	err := c.Connect("tcp://localhost:1883")
+	err := c.Connect(ctx, "tcp://localhost:1883")
 	if err != nil {
 		t.Errorf("Connect error: %v", err)
 	}
+	fmt.Println(" - connected")
 	time.Sleep(time.Millisecond * 200)
 	err = c.Publish("test", []byte("test"))
 	if err != nil {
 		t.Errorf("Publish error: %v", err)
 	}
-	err = c.Subscribe("test", MQTTQoS(0))
+	err = c.Subscribe("test/", MQTTQoS(0))
 	if err != nil {
 		t.Errorf("Subscribe error: %v", err)
 	}
+	fmt.Println(" - subscribed")
 	err = c.Disconnect()
 	if err != nil {
 		t.Errorf("Disconnect error: %v", err)
 	}
+	fmt.Println(" - disconnected")
+	cancel()
 }
